@@ -1,5 +1,5 @@
 """
-Telegram-бот: следит за новыми объявлениями на cars.av.by,
+Telegram-бот: следит за новыми объявлениями на cars.av.by,  
 фильтрует по вашим условиям и присылает ссылку + краткий обзор от нейронки (Gemini).
 
 Команды в Telegram:
@@ -119,23 +119,47 @@ def tg_updates(offset, timeout=20):
 
 
 def fetch_adverts():
+    # ---------- av.by ----------
+
+def fetch_adverts():
     out = []
+    url = "https://cars.av.by/filter"
+    
+    # Притворяемся обычным браузером
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
     for page in range(1, PAGES + 1):
-        payload = {
-            "page": page,
-            "properties": [
-                {"modified": True, "name": "price_currency", "value": 2},
-                {"name": "price_usd", "value": {"min": PRICE_MIN, "max": PRICE_MAX}},
-            ],
-            "sorting": 4,  # сначала новые
+        params = {
+            "price_usd[min]": PRICE_MIN,
+            "price_usd[max]": PRICE_MAX,
+            "sort": 4, # сначала новые
+            "page": page
         }
-        r = requests.post(API_URL, json=payload, headers=HEADERS, timeout=30)
+        
+        r = requests.get(url, params=params, headers=headers, timeout=30)
         r.raise_for_status()
-        ads = r.json().get("adverts", [])
+        
+        # Достаем скрытые данные из кода страницы (там лежит готовый JSON)
+        match = re.search(r'id="__NEXT_DATA__" type="application/json">({.*?})</script>', r.text, re.DOTALL)
+        if not match:
+            break
+            
+        try:
+            data = json.loads(match.group(1))
+            ads = data['props']['initialState']['filter']['main']['adverts']
+        except Exception:
+            break
+            
         if not ads:
             break
+            
         out.extend(ads)
         time.sleep(1)
+        
     return out
 
 
@@ -251,10 +275,10 @@ def ad_facts(ad):
 
 
 PROMPT = """Ты помогаешь человеку, который совсем не разбирается в автомобилях, выбрать подержанную машину в Беларуси.
-Ниже данные из объявления. Дай короткий обзор по-русски простыми словами, без жаргона.
+Ниже данные из объявления. Дай короткий обзор по-русски простыми словами.
 
 Формат (без markdown, без звёздочек):
-Вердикт: одно из «Стоит посмотреть» / «Смотреть с осторожностью» / «Лучше пропустить» + одно предложение почему.
+Вердикт: одно из «Стоит посмотреть» / «Смотреть с осторожностью» / «Лучше пропустить» + пару предложений почему.
 Цена: дорого / нормально / дёшево для такого года и пробега (если не уверен, так и скажи).
 Плюсы: 1-3 пункта.
 Минусы и риски: 1-3 пункта (учти красные флаги в описании: ДТП, покраска, такси, не на ходу, срочно, скрутка пробега, плохо растаможена и т.п.).

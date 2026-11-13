@@ -1,5 +1,5 @@
 """
-Telegram-бот: следит за новыми объявлениями на cars.av.by,  
+Telegram-бот: следит за новыми объявлениями на cars.av.by,
 фильтрует по вашим условиям и присылает ссылку + краткий обзор от нейронки (Gemini).
 
 Команды в Telegram:
@@ -118,48 +118,77 @@ def tg_updates(offset, timeout=20):
 # ---------- av.by ----------
 
 
-def fetch_adverts():
-    # ---------- av.by ----------
+HEADER_VARIANTS = [
+    ("browser", {
+        **HEADERS,
+        "Content-Type": "application/json",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "x-device-type": "web.desktop",
+    }),
+    ("plain", HEADERS),
+]
+
+
+def payload_variants(page):
+    rng = {"min": PRICE_MIN, "max": PRICE_MAX}
+    return [
+        ("modified", {"page": page, "properties": [
+            {"modified": True, "name": "price_currency", "value": 2},
+            {"modified": True, "name": "price_usd", "value": rng}], "sorting": 4}),
+        ("basic", {"page": page, "properties": [
+            {"name": "price_usd", "value": rng}], "sorting": 4}),
+        ("nosort", {"page": page, "properties": [
+            {"name": "price_usd", "value": rng}]}),
+        ("empty", {"page": page, "properties": [], "sorting": 4}),
+    ]
+
+
+def probe_html():
+    """Диагностика: что отдаёт обычная страница поиска."""
+    try:
+        r = requests.get(
+            "https://cars.av.by/filter",
+            params={"price_usd[min]": PRICE_MIN, "price_usd[max]": PRICE_MAX},
+            headers={**HEADERS, "Accept": "text/html"}, timeout=30)
+        return f"HTML-страница: {r.status_code}, {len(r.text)} байт, __NEXT_DATA__: {'__NEXT_DATA__' in r.text}"
+    except Exception as e:
+        return f"HTML-страница: ошибка {type(e).__name__}"
+
+
+def fetch_page(page):
+    """Пробует варианты запроса, запоминает рабочий. Возвращает список объявлений."""
+    global WORKING
+    combos = [(hn, h, pn) for hn, h in HEADER_VARIANTS for pn, _ in payload_variants(page)]
+    if WORKING:
+        combos.sort(key=lambda c: (c[0], c[2]) != WORKING)
+    log_lines = []
+    for hn, h, pn in combos:
+        payload = dict(payload_variants(page))[pn]
+        try:
+            r = requests.post(API_URL, json=payload, headers=h, timeout=30)
+            data = r.json() if r.headers.get("content-type", "").startswith("application/json") else None
+        except Exception as e:
+            log_lines.append(f"{hn}/{pn}: ошибка {type(e).__name__}")
+            continue
+        if r.status_code == 200 and isinstance(data, dict) and "adverts" in data:
+            WORKING = (hn, pn)
+            return data["adverts"]
+        log_lines.append(f"{hn}/{pn}: {r.status_code} {r.text[:110].strip()!r}")
+        time.sleep(1)
+    raise RuntimeError("Ни один вариант запроса не подошёл:\n" + "\n".join(log_lines) + "\n" + probe_html())
+
+
+WORKING = None
+
 
 def fetch_adverts():
     out = []
-    url = "https://cars.av.by/filter"
-    
-    # Притворяемся обычным браузером
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    }
-
     for page in range(1, PAGES + 1):
-        params = {
-            "price_usd[min]": PRICE_MIN,
-            "price_usd[max]": PRICE_MAX,
-            "sort": 4, # сначала новые
-            "page": page
-        }
-        
-        r = requests.get(url, params=params, headers=headers, timeout=30)
-        r.raise_for_status()
-        
-        # Достаем скрытые данные из кода страницы (там лежит готовый JSON)
-        match = re.search(r'id="__NEXT_DATA__" type="application/json">({.*?})</script>', r.text, re.DOTALL)
-        if not match:
-            break
-            
-        try:
-            data = json.loads(match.group(1))
-            ads = data['props']['initialState']['filter']['main']['adverts']
-        except Exception:
-            break
-            
+        ads = fetch_page(page)
         if not ads:
             break
-            
         out.extend(ads)
         time.sleep(1)
-        
     return out
 
 
@@ -275,10 +304,10 @@ def ad_facts(ad):
 
 
 PROMPT = """Ты помогаешь человеку, который совсем не разбирается в автомобилях, выбрать подержанную машину в Беларуси.
-Ниже данные из объявления. Дай короткий обзор по-русски простыми словами.
+Ниже данные из объявления. Дай короткий обзор по-русски простыми словами, без жаргона.
 
 Формат (без markdown, без звёздочек):
-Вердикт: одно из «Стоит посмотреть» / «Смотреть с осторожностью» / «Лучше пропустить» + пару предложений почему.
+Вердикт: одно из «Стоит посмотреть» / «Смотреть с осторожностью» / «Лучше пропустить» + одно предложение почему.
 Цена: дорого / нормально / дёшево для такого года и пробега (если не уверен, так и скажи).
 Плюсы: 1-3 пункта.
 Минусы и риски: 1-3 пункта (учти красные флаги в описании: ДТП, покраска, такси, не на ходу, срочно, скрутка пробега, плохо растаможена и т.п.).
@@ -350,10 +379,10 @@ def scan(seen, silent=False):
         state["fail_streak"] += 1
         state["last_error"] = f"{type(e).__name__}: {e}"
         log.error("fetch error: %s", e)
-        if state["fail_streak"] == 3:
+        if state["fail_streak"] in (1, 3):
             tg_send(
-                "⚠️ av.by не отдаёт данные уже 3 проверки подряд.\n"
-                f"Ошибка: {html.escape(state['last_error'][:300])}\n"
+                "⚠️ Не получается получить данные с av.by (проверок подряд: %d).\n" % state["fail_streak"] +
+                f"Ошибка: {html.escape(state['last_error'][:1800])}\n"
                 "Возможно, сайт изменил запросы или блокирует этот сервер."
             )
         return
